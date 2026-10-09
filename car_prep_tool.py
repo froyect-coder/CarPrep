@@ -1,13 +1,17 @@
 """
 ==============================================================
-  CAR PREP TOOL  v1.1
+  CAR PREP TOOL  v1.3
   by Alfredo Mendez
 
   A Blender addon to streamline vehicle asset preparation
   for game engines. Handles pivot correction, orientation,
   collection organization and FBX export.
 
-  Public Release v1.1
+  Public Release v1.3
+  v1.2: Wheel collections can export with origin at the
+        wheel's own bounding-box center (non-destructive)
+  v1.3: Caliper collections can export with origin at the
+        center of their matching wheel
   Compatible with Blender 4.3 and above
 ==============================================================
   INSTALLATION:
@@ -29,7 +33,7 @@ from mathutils import Vector, Matrix
 bl_info = {
     "name": "Car Prep Tool",
     "author": "Alfredo Mendez",
-    "version": (1, 1),
+    "version": (1, 3),
     "blender": (4, 3, 0),
     "location": "View3D > Sidebar > Car Prep",
     "description": "Vehicle asset preparation tool: pivot, orientation, collections and FBX export for game engines.",
@@ -51,6 +55,22 @@ CAR_COLLECTIONS = [
     ("Rear_Right_Caliper",  "Rear Right Caliper",  "Rear right brake caliper"),
     ("NO_Export",          "NO_Export",          "Hidden from export"),
 ]
+
+WHEEL_COLLECTIONS = (
+    ("Front_Left_Wheel",  "FL"),
+    ("Front_Right_Wheel", "FR"),
+    ("Rear_Left_Wheel",   "RL"),
+    ("Rear_Right_Wheel",  "RR"),
+)
+WHEEL_NAMES = {name for name, _ in WHEEL_COLLECTIONS}
+
+# Each caliper takes the origin of its matching wheel
+CALIPER_TO_WHEEL = {
+    "Front_Left_Caliper":  "Front_Left_Wheel",
+    "Front_Right_Caliper": "Front_Right_Wheel",
+    "Rear_Left_Caliper":   "Rear_Left_Wheel",
+    "Rear_Right_Caliper":  "Rear_Right_Wheel",
+}
 
 FRONT_ITEMS = [
     ("Y",  "+Y -> +X  (default)", "Front faces +Y, will be rotated to +X"),
@@ -149,7 +169,68 @@ def fbx_export_params(filepath):
     )
 
 
-def do_export(context, cname):
+def collection_meshes(cname):
+    col = bpy.data.collections.get(cname)
+    if col is None:
+        return []
+    return [o for o in col.objects if o.type == 'MESH']
+
+
+def bbox_center(mesh_objects):
+    mn, mx = global_bounding_box(mesh_objects)
+    return (mn + mx) / 2
+
+
+def center_meshes_for_export(context, meshes, center):
+    """
+    Temporarily moves the meshes so that `center` lands on the world origin
+    AND every object's origin sits exactly at that point.
+    Works on temporary mesh copies, so shared/instanced wheel meshes
+    (one mesh used by 4 wheels) are never touched.
+    Returns a backup list for restore_centered_meshes().
+    """
+    backups = []
+    offset = Matrix.Translation(-center)
+    for obj in meshes:
+        orig_mw   = obj.matrix_world.copy()
+        orig_data = obj.data
+        orig_name = orig_data.name
+
+        # Temp copy keeps the original mesh name so the FBX looks identical
+        tmp = orig_data.copy()
+        orig_data.name = orig_name + "__carprep_bak"
+        tmp.name = orig_name
+        obj.data = tmp
+
+        # New transform: same rotation/scale, location at world origin
+        new_mw = orig_mw.copy()
+        new_mw.translation = Vector((0.0, 0.0, 0.0))
+
+        # Bake the shift into the temp geometry (local space)
+        local_fix = new_mw.inverted_safe() @ offset @ orig_mw
+        tmp.transform(local_fix, shape_keys=True)
+        tmp.update()
+
+        obj.matrix_world = new_mw
+        backups.append((obj, orig_data, orig_name, tmp, orig_mw))
+
+    context.view_layer.update()
+    return backups
+
+
+def restore_centered_meshes(context, backups):
+    for obj, orig_data, orig_name, tmp, orig_mw in backups:
+        try:
+            obj.data = orig_data
+            obj.matrix_world = orig_mw
+            bpy.data.meshes.remove(tmp)
+            orig_data.name = orig_name
+        except ReferenceError:
+            pass
+    context.view_layer.update()
+
+
+def do_export(context, cname, center=None, origin_note=""):
     blend_path = bpy.data.filepath
     if not blend_path:
         return False, "Save the .blend file first."
@@ -159,15 +240,59 @@ def do_export(context, cname):
     meshes = [o for o in col.objects if o.type == 'MESH']
     if not meshes:
         return False, f"'{cname}' has no mesh objects."
+
     bpy.ops.object.select_all(action='DESELECT')
     for obj in meshes:
         obj.hide_set(False)
         obj.select_set(True)
     context.view_layer.objects.active = meshes[0]
     fbx_path = get_export_path(blend_path, cname)
-    bpy.ops.export_scene.fbx(**fbx_export_params(fbx_path))
-    bpy.ops.object.select_all(action='DESELECT')
-    return True, os.path.basename(fbx_path)
+
+    backups = []
+    try:
+        if center is not None:
+            backups = center_meshes_for_export(context, meshes, center)
+        bpy.ops.export_scene.fbx(**fbx_export_params(fbx_path))
+    finally:
+        if backups:
+            restore_centered_meshes(context, backups)
+        bpy.ops.object.select_all(action='DESELECT')
+
+    suffix = f"  (origin: {origin_note})" if (center is not None and origin_note) else ""
+    return True, os.path.basename(fbx_path) + suffix
+
+
+def resolve_export_center(context, cname):
+    """
+    Decides which origin a collection exports with.
+    Returns (ok, center_or_None, note_or_error).
+      - Wheels   -> center of their own collection
+      - Calipers -> center of their matching wheel collection
+      - Others   -> None (shared car origin)
+    """
+    props = context.scene.car_prep_props
+
+    if cname in WHEEL_NAMES and props.wheel_center_origin:
+        wm = collection_meshes(cname)
+        if not wm:
+            return True, None, ""   # do_export reports the empty collection
+        return True, bbox_center(wm), "wheel center"
+
+    if cname in CALIPER_TO_WHEEL and props.caliper_wheel_origin:
+        wname = CALIPER_TO_WHEEL[cname]
+        wm = collection_meshes(wname)
+        if not wm:
+            return False, None, f"'{cname}' needs '{wname}' to compute its origin."
+        return True, bbox_center(wm), f"{wname} center"
+
+    return True, None, ""
+
+
+def export_with_resolved_origin(context, cname):
+    ok, center, note = resolve_export_center(context, cname)
+    if not ok:
+        return False, note
+    return do_export(context, cname, center=center, origin_note=note)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -180,6 +305,24 @@ class CarPrepProperties(bpy.types.PropertyGroup):
         description="Which axis the vehicle front faces in the imported file",
         items=FRONT_ITEMS,
         default="Y",
+    )
+    wheel_center_origin: bpy.props.BoolProperty(
+        name="Wheel Origin at Center",
+        description=(
+            "Export wheel collections with the origin exactly at the center "
+            "of each wheel collection's bounding box instead of the shared car origin. "
+            "Non-destructive: the scene is restored after export"
+        ),
+        default=False,
+    )
+    caliper_wheel_origin: bpy.props.BoolProperty(
+        name="Caliper Origin at Wheel Center",
+        description=(
+            "Export each caliper collection with the origin at the center of its "
+            "matching wheel collection (FL caliper -> FL wheel, etc.). "
+            "Non-destructive: the scene is restored after export"
+        ),
+        default=False,
     )
 
 
@@ -416,7 +559,7 @@ class OBJECT_OT_export_single_collection(bpy.types.Operator):
     collection_name: bpy.props.StringProperty()
 
     def execute(self, context):
-        ok, msg = do_export(context, self.collection_name)
+        ok, msg = export_with_resolved_origin(context, self.collection_name)
         self.report({'INFO'} if ok else {'ERROR'}, msg)
         return {'FINISHED'} if ok else {'CANCELLED'}
 
@@ -472,7 +615,7 @@ class OBJECT_OT_export_car_collections(bpy.types.Operator):
         for cname, _, _ in CAR_COLLECTIONS:
             if cname == "NO_Export":
                 continue
-            ok, msg = do_export(context, cname)
+            ok, msg = export_with_resolved_origin(context, cname)
             (exported if ok else skipped).append(cname)
 
         self.report({'INFO'},
@@ -586,7 +729,12 @@ class VIEW3D_PT_car_prep_panel(bpy.types.Panel):
 
             # Export individual (not for NO_Export)
             if cname != "NO_Export":
-                exp = row.operator("object.export_single_collection", text="", icon='EXPORT')
+                centered = (
+                    (cname in WHEEL_NAMES and props.wheel_center_origin) or
+                    (cname in CALIPER_TO_WHEEL and props.caliper_wheel_origin)
+                )
+                exp_icon = 'PIVOT_BOUNDBOX' if centered else 'EXPORT'
+                exp = row.operator("object.export_single_collection", text="", icon=exp_icon)
                 exp.collection_name = cname
 
         layout.separator()
@@ -602,6 +750,33 @@ class VIEW3D_PT_car_prep_panel(bpy.types.Panel):
         else:
             box3.alert = True
             box3.label(text="Save the .blend file first", icon='ERROR')
+
+        # Wheel / caliper origin options
+        box_w = layout.box()
+        box_w.label(text="Wheel & Caliper Origin:", icon='PIVOT_BOUNDBOX')
+        box_w.prop(props, "wheel_center_origin",  text="Wheels: Origin at Wheel Center")
+        box_w.prop(props, "caliper_wheel_origin", text="Calipers: Origin at Wheel Center")
+
+        if props.wheel_center_origin or props.caliper_wheel_origin:
+            col_w = box_w.column(align=True)
+            col_w.label(text="Wheel centers:")
+            for wname, short in WHEEL_COLLECTIONS:
+                wm = collection_meshes(wname)
+                if wm:
+                    c = bbox_center(wm)
+                    col_w.label(text=f"  {short}:  {c.x:.3f}, {c.y:.3f}, {c.z:.3f}", icon='DOT')
+                else:
+                    col_w.label(text=f"  {short}:  —", icon='RADIOBUT_OFF')
+
+            # Warn about calipers whose wheel collection is missing
+            if props.caliper_wheel_origin:
+                for caliper, wname in CALIPER_TO_WHEEL.items():
+                    if collection_meshes(caliper) and not collection_meshes(wname):
+                        warn = box_w.row()
+                        warn.alert = True
+                        warn.label(text=f"  {caliper}: missing {wname}", icon='ERROR')
+        else:
+            box_w.label(text="  Wheels & calipers use the shared car origin", icon='INFO')
 
         row = layout.row()
         row.scale_y = 1.8
